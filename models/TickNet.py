@@ -129,7 +129,7 @@ class TickNet(torch.nn.Module):
 ###
 #%% model definitions
 ###
-def build_TickNet(num_classes, typesize='small', cifar=False):
+def build_TickNet(num_classes, typesize='large', cifar=False):
     init_conv_channels = 32
     if typesize=='basic':
         channels = [[128],[64],[128],[256],[512]]
