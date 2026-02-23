@@ -7,40 +7,63 @@ import torch.nn.init
 from .common import conv1x1_block, Classifier,conv3x3_dw_blockAll,conv3x3_block
 from .SE_Attention import *
 class FR_PDP_block(torch.nn.Module):
-    """
-    FR_PDP_block for TickNet.
-    """
     def __init__(self,
                  in_channels,
                  out_channels,
-                 stride):
+                 stride,
+                 expansion=4):
         super().__init__()
-        self.Pw1 = conv1x1_block(in_channels=in_channels,
-                                out_channels=in_channels,                                
-                                use_bn=False,
-                                activation=None)
-        self.Dw = conv3x3_dw_blockAll(channels=in_channels, stride=stride)         
-        self.Pw2 = conv1x1_block(in_channels=in_channels,
-                                             out_channels=out_channels,                                             
-                                             groups=1)
-        self.PwR = conv1x1_block(in_channels=in_channels,
-                                out_channels=out_channels,
-                                stride=stride)
+
         self.stride = stride
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.mid_channels = in_channels * expansion
+
+        # 1. Expand 1x1 (C -> tC)
+        self.expand = conv1x1_block(
+            in_channels=in_channels,
+            out_channels=self.mid_channels,
+            use_bn=True,
+            activation="relu"
+        )
+
+        # 2. Depthwise 3x3 (tC -> tC)
+        self.Dw = conv3x3_dw_blockAll(
+            channels=self.mid_channels,
+            stride=stride
+        )
+
+        # 3. Project 1x1 (tC -> Cout) - Linear bottleneck
+        self.project = conv1x1_block(
+            in_channels=self.mid_channels,
+            out_channels=out_channels,
+            activation=None
+        )
+
+        # Residual projection
+        self.PwR = conv1x1_block(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            stride=stride
+        )
+
+        # Attention
         self.SE = SE(out_channels, 16)
+
     def forward(self, x):
         residual = x
-        x = self.Pw1(x)        
-        x = self.Dw(x)        
-        x = self.Pw2(x)
+
+        x = self.expand(x)
+        x = self.Dw(x)
+        x = self.project(x)
         x = self.SE(x)
+
         if self.stride == 1 and self.in_channels == self.out_channels:
             x = x + residual
-        else:            
+        else:
             residual = self.PwR(residual)
             x = x + residual
+
         return x
 
 class TickNet(torch.nn.Module):
