@@ -11,7 +11,7 @@ class FR_PDP_block(torch.nn.Module):
                  in_channels,
                  out_channels,
                  stride,
-                 expansion=4):
+                 expansion=2):
         super().__init__()
 
         self.stride = stride
