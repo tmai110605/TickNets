@@ -14,105 +14,121 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class MultiScaleDWBlock(nn.Module):
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class DualResidualPathBlock(nn.Module):
     """
-    Multi-Scale Depthwise Convolution Block (Lightweight)
-
-    Split channels into two branches:
-    - Branch A: 3x3 Depthwise (local features)
-    - Branch B: 5x5 Depthwise (larger receptive field)
-
-    Then concatenate + BN + activation.
-
-    Drop-in replacement for conv3x3_dw_blockAll.
+    Dual Residual Path Block for TickNet
+    - Parallel depthwise branches (multi-receptive field)
+    - Learnable fusion weights
+    - Lightweight & mobile friendly
     """
-    def __init__(self, channels, stride=1, activation=True):
-        super().__init__()
-        assert channels % 2 == 0, "channels should be divisible by 2 for channel split"
 
-        self.channels = channels
-        self.stride = stride
-        self.activation = activation
-
-        mid_channels = channels // 2
-
-        # Local branch (3x3 DW)
-        self.dw3 = nn.Conv2d(
-            mid_channels,
-            mid_channels,
-            kernel_size=3,
-            stride=stride,
-            padding=1,
-            groups=mid_channels,
-            bias=False
-        )
-
-        # Context branch (5x5 DW)
-        self.dw5 = nn.Conv2d(
-            mid_channels,
-            mid_channels,
-            kernel_size=5,
-            stride=stride,
-            padding=2,
-            groups=mid_channels,
-            bias=False
-        )
-
-        self.bn = nn.BatchNorm2d(channels)
-        self.act = nn.ReLU(inplace=True) if activation else nn.Identity()
-
-    def forward(self, x):
-        # Split channel-wise
-        c = x.shape[1] // 2
-        x1 = x[:, :c, :, :]   # local branch
-        x2 = x[:, c:, :, :]   # context branch
-
-        x1 = self.dw3(x1)
-        x2 = self.dw5(x2)
-
-        # Concatenate multi-scale features
-        out = torch.cat([x1, x2], dim=1)
-        out = self.bn(out)
-        out = self.act(out)
-
-        return out
-
-
-class FR_PDP_block(torch.nn.Module):
-    """
-    FR_PDP_block for TickNet.
-    """
     def __init__(self,
                  in_channels,
                  out_channels,
-                 stride):
+                 stride,
+                 use_se=True):
         super().__init__()
-        self.Pw1 = conv1x1_block(in_channels=in_channels,
-                                out_channels=in_channels,                                
-                                use_bn=False,
-                                activation=None)
-        self.Dw = MultiScaleDWBlock(channels=in_channels, stride=stride)         
-        self.Pw2 = conv1x1_block(in_channels=in_channels,
-                                             out_channels=out_channels,                                             
-                                             groups=1)
-        self.PwR = conv1x1_block(in_channels=in_channels,
-                                out_channels=out_channels,
-                                stride=stride)
+
         self.stride = stride
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.SE = SE(out_channels, 16)
+        self.use_se = use_se
+
+        # 1x1 projection (same as your Pw1)
+        self.Pw1 = conv1x1_block(
+            in_channels=in_channels,
+            out_channels=in_channels,
+            use_bn=False,
+            activation=None
+        )
+
+        # Branch A: Local receptive field
+        self.dw_local = nn.Conv2d(
+            in_channels,
+            in_channels,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            groups=in_channels,
+            bias=False
+        )
+
+        # Branch B: Larger receptive field (global context)
+        self.dw_global = nn.Conv2d(
+            in_channels,
+            in_channels,
+            kernel_size=5,
+            stride=stride,
+            padding=2,
+            groups=in_channels,
+            bias=False
+        )
+
+        self.bn_local = nn.BatchNorm2d(in_channels)
+        self.bn_global = nn.BatchNorm2d(in_channels)
+
+        # Learnable fusion weights (novel point)
+        self.alpha = nn.Parameter(torch.tensor(0.5))
+        self.beta = nn.Parameter(torch.tensor(0.5))
+
+        # Pointwise expansion (same role as Pw2)
+        self.Pw2 = conv1x1_block(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            groups=1
+        )
+
+        # Residual projection if needed
+        self.PwR = conv1x1_block(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            stride=stride
+        )
+
+        # SE attention (reuse your module)
+        if self.use_se:
+            self.SE = SE(out_channels, 16)
+
+        # Residual scaling for training stability (research trick)
+        self.res_scale = nn.Parameter(torch.ones(1) * 0.1)
+
     def forward(self, x):
         residual = x
-        x = self.Pw1(x)        
-        x = self.Dw(x)        
+
+        # Projection
+        x = self.Pw1(x)
+
+        # Dual branches
+        local_feat = self.bn_local(self.dw_local(x))
+        global_feat = self.bn_global(self.dw_global(x))
+
+        # Normalized fusion weights (stable training)
+        weight_sum = self.alpha.abs() + self.beta.abs() + 1e-6
+        alpha = self.alpha.abs() / weight_sum
+        beta = self.beta.abs() / weight_sum
+
+        # Fusion (core novelty)
+        x = alpha * local_feat + beta * global_feat
+
+        # Pointwise expansion
         x = self.Pw2(x)
-        x = self.SE(x)
+
+        # Attention
+        if self.use_se:
+            x = self.SE(x)
+
+        # Residual connection
         if self.stride == 1 and self.in_channels == self.out_channels:
-            x = x + residual
-        else:            
+            x = residual + self.res_scale * x
+        else:
             residual = self.PwR(residual)
-            x = x + residual
+            x = residual + self.res_scale * x
+
         return x
 class TickNet(torch.nn.Module):
     """
@@ -142,7 +158,7 @@ class TickNet(torch.nn.Module):
             stage = torch.nn.Sequential()
             for unit_id, unit_channels in enumerate(stage_channels):
                 stride = strides[stage_id] if unit_id == 0 else 1                
-                stage.add_module("unit{}".format(unit_id + 1), FR_PDP_block(in_channels=in_channels, out_channels=unit_channels, stride=stride))
+                stage.add_module("unit{}".format(unit_id + 1), DualResidualPathBlock(in_channels=in_channels, out_channels=unit_channels, stride=stride))
                 in_channels = unit_channels
             self.backbone.add_module("stage{}".format(stage_id + 1), stage)
         self.final_conv_channels = 1024        
