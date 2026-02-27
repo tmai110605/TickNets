@@ -22,7 +22,7 @@ import torch.nn as nn
 class FactorizedDWConvBlock(nn.Module):
     """
     Factorized Depthwise Convolution:
-    3x1 DW + 1x3 DW (direction-aware, lightweight)
+    3x1 DW + 1x3 DW
     """
     def __init__(self, channels, stride=1, use_bn=True, activation="relu"):
         super().__init__()
