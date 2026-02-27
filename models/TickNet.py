@@ -19,27 +19,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class DualResidualPathBlock(nn.Module):
+class FR_PDP_FDP_block(torch.nn.Module):
     """
-    Dual Residual Path Block for TickNet
-    - Parallel depthwise branches (multi-receptive field)
-    - Learnable fusion weights
-    - Lightweight & mobile friendly
+    Frequency-aware FR_PDP_block (FDP enhanced)
+    Lightweight + Dual Frequency Path
     """
-
     def __init__(self,
                  in_channels,
                  out_channels,
-                 stride,
-                 use_se=True):
+                 stride):
         super().__init__()
-
-        self.stride = stride
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.use_se = use_se
-
-        # 1x1 projection (same as your Pw1)
+        
+        # ===== Pointwise Expand (giữ nguyên triết lý TickNet) =====
         self.Pw1 = conv1x1_block(
             in_channels=in_channels,
             out_channels=in_channels,
@@ -47,87 +38,77 @@ class DualResidualPathBlock(nn.Module):
             activation=None
         )
 
-        # Branch A: Local receptive field
-        self.dw_local = nn.Conv2d(
-            in_channels,
-            in_channels,
-            kernel_size=3,
-            stride=stride,
-            padding=1,
-            groups=in_channels,
-            bias=False
+        # ===== Shared Depthwise (core lightweight) =====
+        self.Dw = conv3x3_dw_blockAll(
+            channels=in_channels,
+            stride=stride
         )
 
-        # Branch B: Larger receptive field (global context)
-        self.dw_global = nn.Conv2d(
-            in_channels,
-            in_channels,
-            kernel_size=5,
-            stride=stride,
-            padding=2,
-            groups=in_channels,
-            bias=False
+        # ===== Low-Frequency extractor (CỰC NHẸ) =====
+        self.pool = torch.nn.AvgPool2d(kernel_size=3, stride=1, padding=1)
+
+        # ===== Gating for frequency fusion (điểm publish) =====
+        self.freq_gate = torch.nn.Sequential(
+            torch.nn.AdaptiveAvgPool2d(1),
+            torch.nn.Conv2d(in_channels, in_channels // 4, 1, bias=False),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Conv2d(in_channels // 4, 2, 1, bias=True),
+            torch.nn.Softmax(dim=1)  # [alpha, beta]
         )
 
-        self.bn_local = nn.BatchNorm2d(in_channels)
-        self.bn_global = nn.BatchNorm2d(in_channels)
-
-        # Learnable fusion weights (novel point)
-        self.alpha = nn.Parameter(torch.tensor(0.5))
-        self.beta = nn.Parameter(torch.tensor(0.5))
-
-        # Pointwise expansion (same role as Pw2)
+        # ===== Project =====
         self.Pw2 = conv1x1_block(
             in_channels=in_channels,
             out_channels=out_channels,
             groups=1
         )
 
-        # Residual projection if needed
+        # Residual projection
         self.PwR = conv1x1_block(
             in_channels=in_channels,
             out_channels=out_channels,
             stride=stride
         )
 
-        # SE attention (reuse your module)
-        if self.use_se:
-            self.SE = SE(out_channels, 16)
+        self.SE = SE(out_channels, 16)
 
-        # Residual scaling for training stability (research trick)
-        self.res_scale = nn.Parameter(torch.ones(1) * 0.1)
+        self.stride = stride
+        self.in_channels = in_channels
+        self.out_channels = out_channels
 
     def forward(self, x):
         residual = x
 
-        # Projection
+        # 1. Expand
         x = self.Pw1(x)
 
-        # Dual branches
-        local_feat = self.bn_local(self.dw_local(x))
-        global_feat = self.bn_global(self.dw_global(x))
+        # 2. Shared depthwise feature
+        x_dw = self.Dw(x)
 
-        # Normalized fusion weights (stable training)
-        weight_sum = self.alpha.abs() + self.beta.abs() + 1e-6
-        alpha = self.alpha.abs() / weight_sum
-        beta = self.beta.abs() / weight_sum
+        # 3. Frequency decomposition
+        # Low-frequency (blur / smooth)
+        x_lf = self.pool(x_dw)
 
-        # Fusion (core novelty)
-        x = alpha * local_feat + beta * global_feat
+        # High-frequency (detail residual)
+        x_hf = x_dw - x_lf
 
-        # Pointwise expansion
+        # 4. Adaptive frequency fusion (NOVEL PART)
+        gate = self.freq_gate(x_dw)
+        alpha = gate[:, 0:1, :, :]
+        beta = gate[:, 1:2, :, :]
+
+        x = alpha * x_hf + beta * x_lf
+
+        # 5. Project + SE
         x = self.Pw2(x)
+        x = self.SE(x)
 
-        # Attention
-        if self.use_se:
-            x = self.SE(x)
-
-        # Residual connection
+        # 6. Residual connection (giữ FR logic gốc)
         if self.stride == 1 and self.in_channels == self.out_channels:
-            x = residual + self.res_scale * x
+            x = x + residual
         else:
             residual = self.PwR(residual)
-            x = residual + self.res_scale * x
+            x = x + residual
 
         return x
 class TickNet(torch.nn.Module):
@@ -158,7 +139,7 @@ class TickNet(torch.nn.Module):
             stage = torch.nn.Sequential()
             for unit_id, unit_channels in enumerate(stage_channels):
                 stride = strides[stage_id] if unit_id == 0 else 1                
-                stage.add_module("unit{}".format(unit_id + 1), DualResidualPathBlock(in_channels=in_channels, out_channels=unit_channels, stride=stride))
+                stage.add_module("unit{}".format(unit_id + 1), FR_PDP_FDP_block(in_channels=in_channels, out_channels=unit_channels, stride=stride))
                 in_channels = unit_channels
             self.backbone.add_module("stage{}".format(stage_id + 1), stage)
         self.final_conv_channels = 1024        
