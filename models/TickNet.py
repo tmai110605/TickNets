@@ -17,100 +17,107 @@ import torch.nn.functional as F
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.nn as nn
 
-
-class FR_PDP_FDP_block(torch.nn.Module):
+class FactorizedDWConvBlock(nn.Module):
     """
-    Frequency-aware FR_PDP_block (FDP enhanced)
-    Lightweight + Dual Frequency Path
+    Factorized Depthwise Convolution:
+    3x1 DW + 1x3 DW (direction-aware, lightweight)
+    """
+    def __init__(self, channels, stride=1, use_bn=True, activation="relu"):
+        super().__init__()
+
+        self.dw_vert = nn.Conv2d(
+            in_channels=channels,
+            out_channels=channels,
+            kernel_size=(3, 1),
+            stride=(stride, 1),
+            padding=(1, 0),
+            groups=channels,
+            bias=False
+        )
+
+        self.dw_hori = nn.Conv2d(
+            in_channels=channels,
+            out_channels=channels,
+            kernel_size=(1, 3),
+            stride=(1, stride),
+            padding=(0, 1),
+            groups=channels,
+            bias=False
+        )
+
+        self.use_bn = use_bn
+        if use_bn:
+            self.bn = nn.BatchNorm2d(channels)
+
+        if activation == "relu":
+            self.act = nn.ReLU(inplace=True)
+        elif activation is None:
+            self.act = None
+        else:
+            raise NotImplementedError()
+
+    def forward(self, x):
+        # Vertical receptive field
+        x = self.dw_vert(x)
+        # Horizontal receptive field
+        x = self.dw_hori(x)
+
+        if self.use_bn:
+            x = self.bn(x)
+
+        if self.act is not None:
+            x = self.act(x)
+
+        return x
+
+
+def conv_factorized_dw_blockAll(channels, stride):
+    return FactorizedDWConvBlock(
+        channels=channels,
+        stride=stride,
+        use_bn=True,
+        activation="relu"
+    )
+
+class FR_PDP_block(torch.nn.Module):
+    """
+    FR_PDP_block for TickNet.
     """
     def __init__(self,
                  in_channels,
                  out_channels,
                  stride):
         super().__init__()
-        
-        # ===== Pointwise Expand (giữ nguyên triết lý TickNet) =====
-        self.Pw1 = conv1x1_block(
-            in_channels=in_channels,
-            out_channels=in_channels,
-            use_bn=False,
-            activation=None
-        )
-
-        # ===== Shared Depthwise (core lightweight) =====
-        self.Dw = conv3x3_dw_blockAll(
-            channels=in_channels,
-            stride=stride
-        )
-
-        # ===== Low-Frequency extractor (CỰC NHẸ) =====
-        self.pool = torch.nn.AvgPool2d(kernel_size=3, stride=1, padding=1)
-
-        # ===== Gating for frequency fusion (điểm publish) =====
-        self.freq_gate = torch.nn.Sequential(
-            torch.nn.AdaptiveAvgPool2d(1),
-            torch.nn.Conv2d(in_channels, in_channels // 4, 1, bias=False),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.Conv2d(in_channels // 4, 2, 1, bias=True),
-            torch.nn.Softmax(dim=1)  # [alpha, beta]
-        )
-
-        # ===== Project =====
-        self.Pw2 = conv1x1_block(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            groups=1
-        )
-
-        # Residual projection
-        self.PwR = conv1x1_block(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            stride=stride
-        )
-
-        self.SE = SE(out_channels, 16)
-
+        self.Pw1 = conv1x1_block(in_channels=in_channels,
+                                out_channels=in_channels,                                
+                                use_bn=False,
+                                activation=None)
+        self.Dw = conv_factorized_dw_blockAll(channels=in_channels, stride=stride)         
+        self.Pw2 = conv1x1_block(in_channels=in_channels,
+                                             out_channels=out_channels,                                             
+                                             groups=1)
+        self.PwR = conv1x1_block(in_channels=in_channels,
+                                out_channels=out_channels,
+                                stride=stride)
         self.stride = stride
         self.in_channels = in_channels
         self.out_channels = out_channels
-
+        self.SE = SE(out_channels, 16)
     def forward(self, x):
         residual = x
-
-        # 1. Expand
-        x = self.Pw1(x)
-
-        # 2. Shared depthwise feature
-        x_dw = self.Dw(x)
-
-        # 3. Frequency decomposition
-        # Low-frequency (blur / smooth)
-        x_lf = self.pool(x_dw)
-
-        # High-frequency (detail residual)
-        x_hf = x_dw - x_lf
-
-        # 4. Adaptive frequency fusion (NOVEL PART)
-        gate = self.freq_gate(x_dw)
-        alpha = gate[:, 0:1, :, :]
-        beta = gate[:, 1:2, :, :]
-
-        x = alpha * x_hf + beta * x_lf
-
-        # 5. Project + SE
+        x = self.Pw1(x)        
+        x = self.Dw(x)        
         x = self.Pw2(x)
         x = self.SE(x)
-
-        # 6. Residual connection (giữ FR logic gốc)
         if self.stride == 1 and self.in_channels == self.out_channels:
             x = x + residual
-        else:
+        else:            
             residual = self.PwR(residual)
             x = x + residual
-
         return x
+
 class TickNet(torch.nn.Module):
     """
     Class for constructing TickNet.    
@@ -127,19 +134,23 @@ class TickNet(torch.nn.Module):
         super().__init__()
         self.use_data_batchnorm = use_data_batchnorm
         self.in_size = in_size
+
         self.backbone = torch.nn.Sequential()
+
         # data batchnorm
         if self.use_data_batchnorm:
             self.backbone.add_module("data_bn", torch.nn.BatchNorm2d(num_features=in_channels))
+
         # init conv
         self.backbone.add_module("init_conv", conv3x3_block(in_channels=in_channels, out_channels=init_conv_channels, stride=init_conv_stride))
+
         # stages
         in_channels = init_conv_channels
         for stage_id, stage_channels in enumerate(channels):
             stage = torch.nn.Sequential()
             for unit_id, unit_channels in enumerate(stage_channels):
                 stride = strides[stage_id] if unit_id == 0 else 1                
-                stage.add_module("unit{}".format(unit_id + 1), FR_PDP_FDP_block(in_channels=in_channels, out_channels=unit_channels, stride=stride))
+                stage.add_module("unit{}".format(unit_id + 1), FR_PDP_block(in_channels=in_channels, out_channels=unit_channels, stride=stride))
                 in_channels = unit_channels
             self.backbone.add_module("stage{}".format(stage_id + 1), stage)
         self.final_conv_channels = 1024        
@@ -148,7 +159,9 @@ class TickNet(torch.nn.Module):
         in_channels = self.final_conv_channels
         # classifier
         self.classifier = Classifier(in_channels=in_channels, num_classes=num_classes)
+
         self.init_params()
+
     def init_params(self):
         # backbone
         for name, module in self.backbone.named_modules():
@@ -156,16 +169,19 @@ class TickNet(torch.nn.Module):
                 torch.nn.init.kaiming_uniform_(module.weight)
                 if module.bias is not None:
                     torch.nn.init.constant_(module.bias, 0)
+
         # classifier
         self.classifier.init_params()
+
     def forward(self, x):
         x = self.backbone(x)
         x = self.classifier(x)
         return x
+
 ###
 #%% model definitions
 ###
-def build_TickNet(num_classes, typesize='large', cifar=False):
+def build_TickNet(num_classes, typesize='small', cifar=False):
     init_conv_channels = 32
     if typesize=='basic':
         channels = [[128],[64],[128],[256],[512]]
