@@ -29,18 +29,18 @@ class FactorizedDWConvBlock(nn.Module):
 
         self.dw_vert = nn.Conv2d(
             channels, channels,
-            kernel_size=(7, 1),   # đổi 3 → 5
+            kernel_size=(3, 1),   # đổi 3 → 5
             stride=(stride, 1),
-            padding=(3, 0),
+            padding=(1, 0),
             groups=channels,
             bias=False
         )
 
         self.dw_hori = nn.Conv2d(
             channels, channels,
-            kernel_size=(1, 7),
+            kernel_size=(1, 3),
             stride=(1, stride),
-            padding=(0, 3),
+            padding=(0, 1),
             groups=channels,
             bias=False
         )
