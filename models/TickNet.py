@@ -19,28 +19,51 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn as nn
 
-class FactorizedDWConvBlock(nn.Module):
+class MultiScaleFactorizedDWConvBlock(nn.Module):
     """
-    Factorized Depthwise Convolution:
-    3x1 DW + 1x3 DW
+    Multi-Scale Factorized Depthwise Convolution:
+    Branch A: 3x1 + 1x3
+    Branch B: 5x1 + 1x5
+    Output = sum(A, B)
     """
+
     def __init__(self, channels, stride=1, use_bn=True, activation="relu"):
         super().__init__()
 
-        self.dw_vert = nn.Conv2d(
+        # ----- Branch 3x3 (factorized) -----
+        self.dw3_vert = nn.Conv2d(
             channels, channels,
-            kernel_size=(7, 1),   # đổi 3 → 5
+            kernel_size=(3, 1),
             stride=(stride, 1),
-            padding=(3, 0),
+            padding=(1, 0),
             groups=channels,
             bias=False
         )
 
-        self.dw_hori = nn.Conv2d(
+        self.dw3_hori = nn.Conv2d(
             channels, channels,
-            kernel_size=(1, 7),
+            kernel_size=(1, 3),
             stride=(1, stride),
-            padding=(0, 3),
+            padding=(0, 1),
+            groups=channels,
+            bias=False
+        )
+
+        # ----- Branch 5x5 (factorized) -----
+        self.dw5_vert = nn.Conv2d(
+            channels, channels,
+            kernel_size=(5, 1),
+            stride=(stride, 1),
+            padding=(2, 0),
+            groups=channels,
+            bias=False
+        )
+
+        self.dw5_hori = nn.Conv2d(
+            channels, channels,
+            kernel_size=(1, 5),
+            stride=(1, stride),
+            padding=(0, 2),
             groups=channels,
             bias=False
         )
@@ -51,28 +74,33 @@ class FactorizedDWConvBlock(nn.Module):
 
         if activation == "relu":
             self.act = nn.ReLU(inplace=True)
-        elif activation is None:
-            self.act = None
         else:
-            raise NotImplementedError()
+            self.act = None
 
     def forward(self, x):
-        # Vertical receptive field
-        x = self.dw_vert(x)
-        # Horizontal receptive field
-        x = self.dw_hori(x)
+
+        # Branch 3x3
+        b3 = self.dw3_vert(x)
+        b3 = self.dw3_hori(b3)
+
+        # Branch 5x5
+        b5 = self.dw5_vert(x)
+        b5 = self.dw5_hori(b5)
+
+        # Sum fusion (không tăng channel)
+        out = b3 + b5
 
         if self.use_bn:
-            x = self.bn(x)
+            out = self.bn(out)
 
         if self.act is not None:
-            x = self.act(x)
+            out = self.act(out)
 
-        return x
+        return out
 
 
 def conv_factorized_dw_blockAll(channels, stride):
-    return FactorizedDWConvBlock(
+    return MultiScaleFactorizedDWConvBlock(
         channels=channels,
         stride=stride,
         use_bn=True,
